@@ -102,13 +102,17 @@ Your choices are remembered. "Last report" reopens the previous result with the 
 
 A folder marked "(rest)" means the loose files in that folder, not counting subfolders that are listed separately, so nothing gets counted twice.
 
+## Scan depth
+
+Every scan measures the whole disk, so folder totals are always complete. The depth (default 6) sets how many folder levels get their own line, and how far down WEMS looks for single big files. To change it, open Settings → Scan depth, press Enter and type a number. Higher numbers show more detail but make scans slower. The choice is saved in `~/.local/share/wems/wems.conf`.
+
 ## Environment variables
 
 | Variable | Default | |
 |---|---|---|
 | `WEMS_MIN_MB` | 50 | smallest change listed in a comparison |
 | `WEMS_TOP` | 20 | rows in a comparison |
-| `WEMS_DEPTH` | 6 | scan depth |
+| `WEMS_DEPTH` | 6 | scan depth; overrides the one set in Settings |
 | `WEMS_AUTO_KEEP` | 24 | auto snapshots kept |
 | `WEMS_HOME` | `~/.local/share/wems` | where snapshots and reports go |
 | `WEMS_AI_MODEL` | | model passed to the AI tool, e.g. `haiku` |

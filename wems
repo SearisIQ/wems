@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 REPO="${WEMS_REPO:-SearisIQ/wems}"
 WEMS_HOME="${WEMS_HOME:-$HOME/.local/share/wems}"
 SNAP_DIR="$WEMS_HOME/snapshots"
 DATA_VOL="/System/Volumes/Data"
 ROOTS=("$DATA_VOL" "/System/Volumes/Update")
-DEPTH="${WEMS_DEPTH:-6}"
+CONF="$WEMS_HOME/wems.conf"
+DEPTH=6
+[[ -f "$CONF" ]] && DEPTH=$(sed -n 's/^DEPTH=\([1-9][0-9]*\)$/\1/p' "$CONF" | tail -1)
+DEPTH="${WEMS_DEPTH:-${DEPTH:-6}}"
 MIN_MB="${WEMS_MIN_MB:-50}"
 TOP="${WEMS_TOP:-20}"
 AUTO_KEEP="${WEMS_AUTO_KEEP:-24}"
@@ -702,22 +705,38 @@ tui_scopes() {
   done
 }
 
+tui_depth() {
+  local d
+  screen
+  printf '  %sSCAN DEPTH%s  %snow %s · default 6 · empty cancels%s\n' "$BOLD" "$RST" "$DIM" "$DEPTH" "$RST"
+  printf '  %sHigher numbers list deeper folders and find big files further down, but scans get slower.%s\n\n' "$YELLOW" "$RST"
+  tput cnorm; IFS= read -e -r -p "  Depth: " d; tput civis
+  d="${d//[[:space:]]/}"
+  [[ -z "$d" ]] && return
+  if [[ ! "$d" =~ ^[1-9][0-9]{0,2}$ ]]; then printf '\n  %sEnter a whole number from 1 to 999.%s\n' "$RED" "$RST"; press_any_key; return; fi
+  DEPTH=$d
+  mkdir -p "$WEMS_HOME"; printf 'DEPTH=%s\n' "$DEPTH" >"$CONF"
+  [[ -n "${WEMS_DEPTH:-}" ]] && { printf '\n  %sSaved, but WEMS_DEPTH=%s is set in your shell and wins over this.%s\n' "$YELLOW" "$WEMS_DEPTH" "$RST"; press_any_key; }
+}
+
 tui_settings() {
   local sel=0 items
   while :; do
+    items=("$(row "Scan depth" "$DEPTH  ${DIM}⏎ type a number · higher is slower${RST}")")
     if ai_on; then
       ai_load
-      items=("$(row "AI mode" "On")" "$(row "Saved folders" "${#AI_SCOPES[@]} saved  ${DIM}extra scopes for AI mode${RST}")")
+      items+=("$(row "AI mode" "On")" "$(row "Saved folders" "${#AI_SCOPES[@]} saved  ${DIM}extra scopes for AI mode${RST}")")
     else
-      items=("$(row "AI mode" "Off  ${DIM}hidden from the menu${RST}")")
+      items+=("$(row "AI mode" "Off  ${DIM}hidden from the menu${RST}")")
     fi
     MENU_START=$sel
     menu "${BOLD}SETTINGS${RST}" "${items[@]}"
     sel=$PICK
     case $PICK in
       -1) return ;;
-      0) if ai_on; then set_ai off; else set_ai on; fi ;;
-      1) tui_scopes ;;
+      0) tui_depth ;;
+      1) if ai_on; then set_ai off; else set_ai on; fi ;;
+      2) tui_scopes ;;
     esac
   done
 }
