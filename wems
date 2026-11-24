@@ -1,0 +1,971 @@
+#!/usr/bin/env bash
+
+VERSION="1.4.0"
+REPO="${WEMS_REPO:-SearisIQ/wems}"
+WEMS_HOME="${WEMS_HOME:-$HOME/.local/share/wems}"
+SNAP_DIR="$WEMS_HOME/snapshots"
+DATA_VOL="/System/Volumes/Data"
+ROOTS=("$DATA_VOL" "/System/Volumes/Update")
+DEPTH="${WEMS_DEPTH:-6}"
+MIN_MB="${WEMS_MIN_MB:-50}"
+TOP="${WEMS_TOP:-20}"
+AUTO_KEEP="${WEMS_AUTO_KEEP:-24}"
+AGENT_LABEL="com.wems.autosnapshot"
+AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+if [[ -t 1 ]]; then
+  BOLD=$'\033[1m' DIM=$'\033[2m' RST=$'\033[0m'
+  RED=$'\033[31m' GREEN=$'\033[32m' YELLOW=$'\033[33m' CYAN=$'\033[36m' MAGENTA=$'\033[35m'
+else
+  BOLD="" DIM="" RST="" RED="" GREEN="" YELLOW="" CYAN="" MAGENTA=""
+fi
+
+BG_PID=""
+TMP_FILES=()
+cleanup() {
+  [[ -n "$BG_PID" ]] && kill "$BG_PID" 2>/dev/null
+  local f; for f in "${TMP_FILES[@]}"; do rm -f "$f"; done
+  [[ -t 1 ]] && tput cnorm 2>/dev/null
+  [[ -n "${ALT_SCREEN:-}" ]] && tput rmcup 2>/dev/null
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+mkdir -p "$SNAP_DIR"
+COLS=$(tput cols 2>/dev/null || echo 100)
+
+human() {
+  awk -v k="$1" -v s="${2:-}" 'BEGIN{a=k<0?-k:k; p=(s=="")?"":(k<0?"-":"+")
+    if(a>=1048576) printf "%s%.1f GB",p,a/1048576; else if(a>=1024) printf "%s%.0f MB",p,a/1024; else printf "%s%d KB",p,a}'
+}
+
+ago() {
+  local s=$(( $(date +%s) - $1 ))
+  if ((s < 60)); then echo "just now"
+  elif ((s < 3600)); then echo "$((s/60))m ago"
+  elif ((s < 86400)); then echo "$((s/3600))h $((s%3600/60))m ago"
+  else echo "$((s/86400))d ago"; fi
+}
+
+disk_kb() { df -k "$DATA_VOL" | awk 'NR==2{print $2, $3, $4}'; }
+free_kb() { disk_kb | awk '{print $3}'; }
+
+spin() {
+  local pid=$1 msg=$2 i=0 t0=$SECONDS
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  BG_PID=$pid
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r  %s%s%s %s… %ds ' "$CYAN" "${frames[i % 10]}" "$RST" "$msg" $((SECONDS - t0))
+    i=$((i + 1)); sleep 0.1
+  done
+  wait "$pid"; local rc=$?; BG_PID=""
+  printf '\r\033[2K'
+  return $rc
+}
+
+tmpfile() { TMPF=$(mktemp -t wems); TMP_FILES+=("$TMPF"); }
+
+big_files() {
+  local mb=$1; shift
+  nice find -x "$@" -maxdepth "$DEPTH" -type f -size +"${mb}"M -exec du -k {} + 2>/dev/null | sed $'s/$/\tf/'
+}
+
+press_any_key() { printf '\n  %sPress any key to go back%s' "$DIM" "$RST"; IFS= read -rsn1 _; }
+
+confirm() {
+  printf '\n  %s %s[y/N]%s ' "$1" "$DIM" "$RST"
+  local k; IFS= read -rsn1 k; echo
+  [[ "$k" == "y" || "$k" == "Y" ]]
+}
+
+show_page() {
+  local text=$1
+  if [[ -t 1 ]] && (( $(printf '%s\n' "$text" | wc -l) > $(tput lines) - 3 )); then
+    printf '%s\n' "$text" | LESSCHARSET=utf-8 less -R
+  else
+    printf '%s\n' "$text"; [[ -t 0 ]] && press_any_key
+  fi
+}
+
+load_snaps() {
+  SNAPS=()
+  local all=() f i
+  for f in "$SNAP_DIR"/*.wems.gz; do [[ -e "$f" ]] && all+=("$f"); done
+  for ((i = ${#all[@]} - 1; i >= 0; i--)); do SNAPS+=("${all[i]}"); done
+}
+
+snap_meta() {
+  gzcat "$1" 2>/dev/null | awk '!/^#/{exit} {split(substr($0,2),a," "); m[a[1]]=a[2]}
+    END{print m["created"]+0, m["free_kb"]+0, m["scanned_kb"]+0}'
+}
+
+snap_label() {
+  local created free scanned tag=""
+  read -r created free scanned <<<"$(snap_meta "$1")"
+  [[ "$1" == *_auto.wems.gz ]] && tag="  ${DIM}auto${RST}"
+  printf '%s  %s(%s)%s  free %s%s' "$(date -r "$created" '+%a %b %d %H:%M')" "$DIM" "$(ago "$created")" "$RST" "$(human "$free")" "$tag"
+}
+
+scan() {
+  local out=$1 raw created total used free
+  tmpfile; raw=$TMPF
+  created=$(date +%s)
+  read -r total used free <<<"$(disk_kb)"
+  if [[ -t 1 ]]; then
+    { nice du -xk -d "$DEPTH" "${ROOTS[@]}"; big_files "$MIN_MB" "${ROOTS[@]}"; } >"$raw" 2>/dev/null &
+    spin $! "Scanning disk (takes 1–2 min)"
+  else
+    { nice du -xk -d "$DEPTH" "${ROOTS[@]}"; big_files "$MIN_MB" "${ROOTS[@]}"; } >"$raw" 2>/dev/null
+  fi
+  {
+    printf '#wems 1\n#created %s\n#total_kb %s\n#used_kb %s\n#free_kb %s\n' "$created" "$total" "$used" "$free"
+    awk -F'\t' -v d="$DATA_VOL" -v u="${ROOTS[1]}" '$2==d||$2==u{s+=$1} END{print "#scanned_kb " s+0}' "$raw"
+    tmutil listlocalsnapshots / 2>/dev/null | grep '^com\.' | sed 's/^/#apfs /'
+    sed -e $'s|\t/System/Volumes/Data$|\t/|' -e $'s|\t/System/Volumes/Data/|\t/|' "$raw"
+  } | gzip -c >"$out"
+}
+
+save_snapshot() {
+  local suffix=""; [[ "$1" == "auto" ]] && suffix="_auto"
+  local out="$SNAP_DIR/$(date +%Y-%m-%d_%H%M%S)$suffix.wems.gz"
+  scan "$out" || { echo "  ${RED}Scan failed${RST}"; rm -f "$out"; return 1; }
+  if [[ -n "$suffix" ]]; then
+    ls -1 "$SNAP_DIR"/*_auto.wems.gz 2>/dev/null | sort -r | tail -n +$((AUTO_KEEP + 1)) | while IFS= read -r f; do rm -f "$f"; done
+  fi
+  SAVED=$out
+}
+
+compare() {
+  local a=$1 b=$2 ca cb
+  read -r ca _ _ <<<"$(snap_meta "$a")"
+  read -r cb _ _ <<<"$(snap_meta "$b")"
+  if ((ca > cb)); then local t=$a; a=$b; b=$t; t=$ca; ca=$cb; cb=$t; fi
+  local la lb
+  la=$(date -r "$ca" '+%a %b %d %H:%M'); lb=$(date -r "$cb" '+%a %b %d %H:%M')
+  [[ "$b" == "$CURRENT_SCAN" ]] && lb="now"
+  awk -F'\t' -v la="$la" -v lb="$lb" -v min=$((MIN_MB * 1024)) -v top="$TOP" -v home="$HOME" \
+      -v cols="$COLS" \
+      -v B="$BOLD" -v D="$DIM" -v R="$RST" -v RD="$RED" -v G="$GREEN" -v Y="$YELLOW" -v C="$CYAN" '
+    function hum(k, s,  a, p) { a = k < 0 ? -k : k; p = s ? (k < 0 ? "−" : "+") : ""
+      if (a >= 1048576) return sprintf("%s%.1f GB", p, a / 1048576)
+      if (a >= 1024) return sprintf("%s%.0f MB", p, a / 1024)
+      return sprintf("%s%d KB", p, a) }
+    function short(p,  w) { if (index(p, home) == 1) p = "~" substr(p, length(home) + 1)
+      w = cols - 24; if (w > 20 && length(p) > w) p = "…" substr(p, length(p) - w + 2); return p }
+    function dur(s) { return s >= 86400 ? sprintf("%dd %dh", s / 86400, s % 86400 / 3600) : sprintf("%dh %dm", s / 3600, s % 3600 / 60) }
+
+    function keep(d, kid) {
+      return d >= min && kid < 0.8 * d
+    }
+
+    FNR == 1 { f++ }
+    /^#/ { split(substr($0, 2), m, " ")
+      if (m[1] == "apfs") snap[f, m[2]] = 1; else meta[f, m[1]] = m[2]
+      next }
+    { kb[f, $2] = $1; seen[$2] = 1; if ($3 == "f") { isf[$2] = 1; hasf[f] = 1 } }
+
+    END {
+      for (p in seen) {
+        if (isf[p] && !(hasf[1] && hasf[2])) continue  # older snapshots list folders only
+        d = kb[2, p] - kb[1, p]; delta[p] = d
+        if (p == "/" || p == "/System/Volumes/Update") continue
+        par = p; sub(/\/[^\/]*$/, "", par); if (par == "") par = "/"
+        if (d > grow_kid[par]) grow_kid[par] = d
+        if (-d > shrink_kid[par]) shrink_kid[par] = -d
+      }
+      ng = ns = 0
+      for (p in delta) {
+        if (delta[p] > 0 && keep(delta[p], grow_kid[p] + 0)) grew[++ng] = p
+        if (delta[p] < 0 && keep(-delta[p], shrink_kid[p] + 0)) shrank[++ns] = p
+      }
+
+      consumed = meta[1, "free_kb"] - meta[2, "free_kb"]
+      scanned = meta[2, "scanned_kb"] - meta[1, "scanned_kb"]
+      printf "\n  %s%s%s  →  %s%s%s   %s(%s apart)%s\n\n", B, la, R, B, lb, R, D, dur(meta[2, "created"] - meta[1, "created"]), R
+      printf "  Free space      %s → %s   %s%s%s\n", hum(meta[1, "free_kb"]), hum(meta[2, "free_kb"]), (consumed > 0 ? RD : G) B, hum(-consumed, 1), R
+      printf "  Files changed   %s\n", hum(scanned, 1)
+      printf "  Not in folders  %s   %sAPFS snapshots, purgeable space, folders WEMS cannot read%s\n", hum(consumed - scanned, 1), D, R
+
+      hdr = 0
+      for (k in snap) { split(k, x, SUBSEP)
+        if (x[1] == 2 && !((1, x[2]) in snap)) { if (!hdr++) printf "\n  %sNew APFS snapshots%s %s(macOS updates / Time Machine)%s\n", Y, R, D, R; printf "    + %s\n", x[2] } }
+      hdr = 0
+      for (k in snap) { split(k, x, SUBSEP)
+        if (x[1] == 1 && !((2, x[2]) in snap)) { if (!hdr++) printf "\n  %sAPFS snapshots gone%s\n", G, R; printf "    − %s\n", x[2] } }
+
+      printf "\n  %sGREW%s %s(changes of %s or more)%s\n", RD B, R, D, hum(min), R
+      if (!ng) printf "    %snothing%s\n", D, R
+      for (i = 1; i <= top && i <= ng; i++) { best = 0
+        for (j = 1; j <= ng; j++) if (!used[grew[j]] && (!best || delta[grew[j]] > delta[best])) best = grew[j]
+        used[best] = 1
+        tag = !((1, best) in kb) ? "  " Y "new" R : ""
+        printf "    %s%10s%s  %s%s\n", RD, hum(delta[best], 1), R, short(best), tag }
+
+      printf "\n  %sSHRANK%s\n", G B, R
+      if (!ns) printf "    %snothing%s\n", D, R
+      for (i = 1; i <= 10 && i <= ns; i++) { best = 0
+        for (j = 1; j <= ns; j++) if (!used[shrank[j]] && (!best || delta[shrank[j]] < delta[best])) best = shrank[j]
+        used[best] = 1
+        tag = !((2, best) in kb) ? "  " D "gone" R : ""
+        printf "    %s%10s%s  %s%s\n", G, hum(delta[best], 1), R, short(best), tag }
+    }' <(gzcat "$a") <(gzcat "$b")
+}
+
+CURRENT_SCAN=""
+scan_current() {
+  tmpfile; CURRENT_SCAN=$TMPF
+  scan "$CURRENT_SCAN"
+}
+
+offer_save_current() {
+  [[ -n "$CURRENT_SCAN" && -s "$CURRENT_SCAN" ]] || return
+  if confirm "Save this scan as a snapshot?"; then
+    local out="$SNAP_DIR/$(date +%Y-%m-%d_%H%M%S).wems.gz"
+    cp "$CURRENT_SCAN" "$out" && echo "  ${GREEN}Saved${RST} $(snap_label "$out")"
+    sleep 1
+  fi
+}
+
+HOGS=(
+  "macOS update staging|/System/Volumes/Update|Install the pending update: Settings → General → Software Update"
+  "Downloaded macOS assets|/System/Library/AssetsV2|Managed by macOS; shrinks once updates install"
+  "Sleep image and swap|/private/var/vm|Restart to shrink swap"
+  "App caches|$HOME/Library/Caches|Apps rebuild these; clear per app"
+  "Dev tool caches|$HOME/.cache|Safe to clear (uv cache clean, pip cache purge, …)"
+  "Downloads|$HOME/Downloads|Delete what you no longer need"
+  "Trash|$HOME/.Trash|Empty the Trash"
+  "Xcode DerivedData|$HOME/Library/Developer/Xcode/DerivedData|Safe to delete; rebuilt on next build"
+  "iOS Simulators|$HOME/Library/Developer/CoreSimulator|xcrun simctl delete unavailable"
+  "iOS DeviceSupport|$HOME/Library/Developer/Xcode/iOS DeviceSupport|Delete versions you no longer debug"
+  "iPhone backups|$HOME/Library/Application Support/MobileSync/Backup|Finder → your iPhone → Manage Backups"
+  "Docker disk image|$HOME/Library/Containers/com.docker.docker|docker system prune -a"
+  "Homebrew downloads|$HOME/Library/Caches/Homebrew|brew cleanup --prune=all"
+  "npm cache|$HOME/.npm|npm cache clean --force"
+  "pnpm store|$HOME/Library/pnpm/store|pnpm store prune"
+  "Gradle caches|$HOME/.gradle/caches|Safe to delete; re-downloaded on build"
+  "Claude app VM|$HOME/Library/Application Support/Claude/vm_bundles|Used by the Claude desktop app; rebuilt if deleted"
+  "Mail attachments|$HOME/Library/Containers/com.apple.mail/Data/Library/Mail Downloads|Old opened attachments"
+  "System logs|/private/var/log|Rotated by macOS"
+)
+
+hogs() {
+  local out entry name path
+  tmpfile; out=$TMPF
+  (
+    for entry in "${HOGS[@]}"; do
+      IFS='|' read -r name path _ <<<"$entry"
+      [[ -e "$path" ]] && printf '%s\t%s\n' "$(du -sk "$path" 2>/dev/null | awk '{print $1}' | tail -1)" "$entry"
+    done
+  ) >"$out" &
+  [[ -t 1 ]] && spin $! "Checking the usual suspects" || wait $!
+
+  local v strays=""
+  for v in /Volumes/*; do
+    [[ -d "$v" && ! -L "$v" && "$v" != "/Volumes/Recovery" ]] || continue
+    mount | grep -qF " on $v (" || strays="$strays$(du -sk "$v" 2>/dev/null | awk '{print $1}')	$v
+"
+  done
+  local snaps; snaps=$(tmutil listlocalsnapshots / 2>/dev/null | grep -c '^com\.')
+  {
+    printf '\n  %sSPACE HOGS%s   %sfree %s%s\n\n' "$BOLD" "$RST" "$DIM" "$(human "$(free_kb)")" "$RST"
+    sort -rn "$out" | awk -F'\t' -v min=102400 -v D="$DIM" -v R="$RST" -v Y="$YELLOW" '
+      function hum(a) { return a >= 1048576 ? sprintf("%.1f GB", a / 1048576) : sprintf("%.0f MB", a / 1024) }
+      $1 >= min { split($2, h, "|"); printf "  %s%9s%s  %s\n             %s%s%s\n", Y, hum($1), R, h[1], D, h[3], R; n++ }
+      END { if (!n) print "  Nothing over 100 MB in the usual places." }'
+    if [[ -n "$strays" ]]; then
+      printf '\n  %sFOLDERS POSING AS DRIVES%s  %sin /Volumes but on your internal disk; the drive was unplugged when they were written%s\n' "$RED$BOLD" "$RST" "$DIM" "$RST"
+      printf '%s' "$strays" | sort -rn | awk -F'\t' '$1 > 0 { printf "  %9s  %s\n", ($1 >= 1048576 ? sprintf("%.1f GB", $1 / 1048576) : sprintf("%.0f MB", $1 / 1024)), $2 }'
+    fi
+    if ((snaps > 0)); then
+      printf '\n  %sAPFS local snapshots: %s%s  %s(their size is hidden; macOS frees them when space runs low.\n' "$YELLOW" "$snaps" "$RST" "$DIM"
+      printf '   List: tmutil listlocalsnapshots /   Thin: tmutil thinlocalsnapshots / 999999999999 4)%s\n' "$RST"
+    fi
+  } >"$out.txt"
+  show_page "$(cat "$out.txt")"; rm -f "$out.txt"
+}
+
+watch_free() {
+  local start cur prev t0=$SECONDS k el rate
+  start=$(free_kb); prev=$start
+  printf '\033[H\033[2J'; banner
+  printf '  %sWATCH FREE SPACE%s  %supdates every 5s · any key stops%s\n\n' "$BOLD" "$RST" "$DIM" "$RST"
+  printf '  %s%-8s  %10s  %12s  %12s  %19s%s\n' "$DIM" "time" "free" "last 5s" "since start" "calculated per hour" "$RST"
+  while :; do
+    cur=$(free_kb); el=$((SECONDS - t0)); ((el < 1)) && el=1
+    rate=$(( (start - cur) * 3600 / el ))
+    printf '  %-8s  %10s  %12s  %12s  %19s\n' "$(date +%H:%M:%S)" "$(human "$cur")" \
+      "$(human $((cur - prev)) signed)" "$(human $((cur - start)) signed)" "$(human $((-rate)) signed)"
+    prev=$cur
+    IFS= read -rsn1 -t 5 k && break
+  done
+}
+
+auto_interval() { [[ -f "$AGENT_PLIST" ]] && plutil -extract StartInterval raw "$AGENT_PLIST" 2>/dev/null; }
+
+auto_status() {
+  local s; s=$(auto_interval)
+  [[ -n "$s" ]] && echo "every $((s / 3600))h" || echo "off"
+}
+
+agent_plist() {
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$AGENT_LABEL</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$SELF</string><string>snap</string><string>--auto</string></array>
+  <key>StartInterval</key><integer>$1</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$WEMS_HOME/auto.log</string>
+  <key>StandardErrorPath</key><string>$WEMS_HOME/auto.log</string>
+</dict>
+</plist>
+EOF
+}
+
+set_auto() {
+  launchctl bootout "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null
+  rm -f "$AGENT_PLIST"
+  if [[ "$1" == "off" ]]; then echo "  Auto snapshots ${BOLD}off${RST}"; return; fi
+  [[ "$1" =~ ^[0-9]+$ ]] && (($1 > 0)) || { echo "  Hours must be a whole number above 0"; return 1; }
+  mkdir -p "$(dirname "$AGENT_PLIST")"
+  agent_plist $(($1 * 3600)) >"$AGENT_PLIST"
+  if launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST"; then
+    echo "  Auto snapshots ${BOLD}every $1h${RST} (keeps the newest $AUTO_KEEP). First one is running now."
+  else
+    echo "  ${RED}Could not start the background job${RST}"; rm -f "$AGENT_PLIST"; return 1
+  fi
+}
+
+uninstall() {
+  set_auto off >/dev/null
+  rm -f "$SELF" && echo "  Removed $SELF"
+  if [[ -t 0 ]] && confirm "Also delete your snapshots in $WEMS_HOME?"; then rm -rf "$WEMS_HOME" && echo "  Removed $WEMS_HOME"; fi
+}
+
+AI_FLAG="$WEMS_HOME/ai_enabled"
+ai_on() { [[ "$(cat "$AI_FLAG" 2>/dev/null)" == on ]]; }
+set_ai() { echo "$1" >"$AI_FLAG"; }
+
+AI_CONF="$WEMS_HOME/ai.conf"
+AI_SCOPES_FILE="$WEMS_HOME/ai_scopes"
+REPORT_DIR="$WEMS_HOME/reports"
+AI_MAX="${WEMS_AI_MAX:-80}"
+AI_SORTS=(size size_asc old new name)
+AI_MINS=(20 50 100 200 500 1024 2048 5120 10240)
+
+ai_load() {
+  AI_TOOL="" AI_PRIVACY=on AI_LASTUSED=on AI_SORT=size AI_MIN_MB=500 AI_SCOPE="" AI_SOURCE=snapshot AI_DETAILS=on
+  [[ -f "$AI_CONF" ]] && . "$AI_CONF"
+  AI_SCOPES=()
+  local l; [[ -f "$AI_SCOPES_FILE" ]] && while IFS= read -r l; do [[ -n "$l" ]] && AI_SCOPES+=("$l"); done <"$AI_SCOPES_FILE"
+  case "$AI_SCOPE" in "" | disk | home) ;; *) is_scope "$AI_SCOPE" && [[ -d "$AI_SCOPE" ]] || AI_SCOPE="" ;; esac
+  AI_AVAILABLE=()
+  local t; for t in claude codex opencode interpreter; do command -v "$t" >/dev/null && AI_AVAILABLE+=("$t"); done
+  case " ${AI_AVAILABLE[*]} " in *" $AI_TOOL "*) ;; *) AI_TOOL=${AI_AVAILABLE[0]:-} ;; esac
+  [[ "$AI_TOOL" == "interpreter" ]] && AI_PRIVACY=on
+}
+
+ai_save() {
+  printf 'AI_TOOL=%s\nAI_PRIVACY=%s\nAI_LASTUSED=%s\nAI_SORT=%s\nAI_MIN_MB=%s\nAI_SCOPE=%q\nAI_SOURCE=%s\nAI_DETAILS=%s\n' \
+    "$AI_TOOL" "$AI_PRIVACY" "$AI_LASTUSED" "$AI_SORT" "$AI_MIN_MB" "$AI_SCOPE" "$AI_SOURCE" "$AI_DETAILS" >"$AI_CONF"
+  ((${#AI_SCOPES[@]})) && printf '%s\n' "${AI_SCOPES[@]}" >"$AI_SCOPES_FILE" || rm -f "$AI_SCOPES_FILE"
+}
+
+is_scope() { local s; for s in "${AI_SCOPES[@]}"; do [[ "$s" == "$1" ]] && return 0; done; return 1; }
+is_custom() { [[ -n "$AI_SCOPE" && "$AI_SCOPE" != disk && "$AI_SCOPE" != home ]]; }
+tilde() { case "$1" in "$HOME" | "$HOME"/*) echo "~${1#"$HOME"}" ;; *) echo "$1" ;; esac; }
+
+scope_name() {
+  case "$AI_SCOPE" in "") echo "Select" ;; disk) echo "Whole disk" ;; home) echo "Home folder only" ;; *) tilde "$AI_SCOPE" ;; esac
+}
+
+prev_in() {
+  local cur=$1 o; shift; local prev=${!#}
+  for o in "$@"; do [[ "$o" == "$cur" ]] && { echo "$prev"; return; }; prev=$o; done
+  echo "$1"
+}
+
+step() { if ((MENU_DIR < 0)); then prev_in "$@"; else next_in "$@"; fi; }
+
+next_in() {
+  local cur=$1 first=$2 hit=""; shift
+  local o; for o in "$@"; do [[ -n "$hit" ]] && { echo "$o"; return; }; [[ "$o" == "$cur" ]] && hit=1; done
+  echo "$first"
+}
+
+tool_name() {
+  case "$1" in claude) echo "Claude Code" ;; codex) echo "Codex" ;; opencode) echo "opencode" ;; interpreter) echo "Open Interpreter" ;; *) echo "none" ;; esac
+}
+
+sort_name() {
+  case "$AI_SORT" in size) echo "Size, largest first" ;; size_asc) echo "Size, smallest first" ;; old) echo "Last used, oldest first" ;;
+    new) echo "Last used, newest first" ;; name) echo "Name, A–Z" ;; esac
+}
+
+last_used() {
+  local p=$1 t
+  if [[ "$p" == *.app ]]; then
+    t=$(mdls -raw -name kMDItemLastUsedDate "$p" 2>/dev/null)
+    [[ -n "$t" && "$t" != "(null)" ]] && date -j -f '%Y-%m-%d %H:%M:%S %z' "$t" +%s 2>/dev/null && return
+  fi
+  find "$p" -maxdepth 1 -exec stat -f %m {} + 2>/dev/null | sort -rn | head -1
+}
+
+ai_candidates() {
+  local src=$1 base=$2 root="/" rest
+  [[ "$AI_SCOPE" == "home" ]] && root=$HOME
+  is_custom && root=$AI_SCOPE
+  rest=$(gzcat "$src" | awk -F'\t' '!/^#/ { n = ($2 == "/") ? 0 : split($2, x, "/"); print n "\t" $1 "\t" $2 }' |
+    sort -t$'\t' -k1,1rn |
+    awk -F'\t' -v min=$((AI_MIN_MB * 1024)) -v root="$root" -v out="$base.raw" '
+      { p = $3; own = $2 - cov[p]; par = p; sub(/\/[^\/]*$/, "", par); if (par == "") par = "/"
+        if (p == root) { rest = own; next }
+        if (own >= min) { cov[par] += $2; if (root == "/" || index(p, root "/") == 1) print own "\t" p "\t" (cov[p] > 0) > out }
+        else cov[par] += cov[p] }
+      END { print rest + 0 }')
+  : >"$base.cand"
+  local id=0 kb p part t
+  if [[ -s "$base.raw" ]]; then
+    while IFS=$'\t' read -r kb p part; do
+      id=$((id + 1)); t=$(last_used "$p")
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$kb" "${t:-0}" "$( [[ -n "$t" ]] && date -r "$t" +%d.%m.%Y || echo '?')" "$p" "$part" >>"$base.cand"
+    done < <(sort -t$'\t' -k1,1rn "$base.raw" | head -n "$AI_MAX")
+  fi
+  rm -f "$base.raw"
+  printf '%s\n%s\n' "$rest" "$3" >"$base.meta"
+}
+
+ai_prompt() {
+  cat <<EOF
+You are helping a Mac user find out what is using their disk space. Below is a list of folders and files
+with their size and the date they last changed. For each one, work out what it is and which app,
+product or kind of file it belongs to.
+
+Rules:
+- The category is the plain name of the app, product or vendor suite that owns the data, e.g.
+  "Google Drive", "Discord", "Xcode", "macOS", "Docker", "Adobe", "Steam", "VS Code".
+  NEVER make separate categories for parts of one product: its app bundle, cache, support files,
+  extensions and documents all go in the SAME category ("VS Code", not "VS Code Extensions" and
+  "VS Code Data"). Say which part it is in the description instead.
+- A path marked (rest) means only the loose files in that folder, not the subfolders listed separately.
+  If a (rest) folder holds data of many different apps, use the category "Mixed (many small folders)".
+- Only Apple's own system files go in "macOS". Group by what the data IS, never by where it sits:
+  loose files in ~/Downloads, ~/Desktop or ~/Documents go in the category of what they are
+  ("Photoshop Files", "Installers", "Voice Recordings"), not in "Downloads".
+- User files that don't belong to an app go in content categories like "Word Documents", "Videos",
+  "Music", "Code Projects".
+EOF
+  if [[ "$AI_PRIVACY" == "on" ]]; then
+    echo "- PRIVACY: do not open, read or list any files or folders. Decide from the paths alone."
+  else
+    echo "- You may look inside the folders with your read-only tools to identify them. Peek at a few"
+    echo "  files per folder at most; do not read everything. You cannot and must not change anything."
+  fi
+  cat <<'EOF'
+- Answer with ONLY these lines, no other text, no markdown, using | as the separator:
+  F|<id>|<category>|<what this folder or file is, max 8 words>
+  C|<category>|<is it safe to delete and how, max 12 words>
+- Every id gets exactly one F line. Every category you use gets exactly one C line.
+
+Folders and files (id, size, last changed, path):
+EOF
+  awk -F'\t' '{ printf "%s\t%.1f GB\t%s\t%s%s\n", $1, $2 / 1048576, $4, $5, ($6 ? " (rest)" : "") }' "$1"
+}
+
+ai_exec() {
+  local base=$1 prompt model=()
+  prompt=$(cat "$base.prompt")
+  [[ -n "${WEMS_AI_MODEL:-}" ]] && model=(--model "$WEMS_AI_MODEL")
+  case "$AI_TOOL" in
+    claude)
+      local tools="Read,Glob,Grep"; [[ "$AI_PRIVACY" == "on" ]] && tools=""
+      (cd / && exec claude -p "$prompt" --tools "$tools" --no-session-persistence "${model[@]}") >"$base.ai" 2>"$base.err" & ;;
+    codex)
+      (cd / && exec codex exec --sandbox read-only --skip-git-repo-check --ephemeral -C / "${model[@]}" -o "$base.ai" "$prompt") >"$base.err" 2>&1 & ;;
+    opencode)
+      local perm='{"*":"deny","read":"allow","glob":"allow","grep":"allow","list":"allow","external_directory":"allow"}'
+      [[ "$AI_PRIVACY" == "on" ]] && perm='{"*":"deny"}'
+      (cd / && OPENCODE_CONFIG_CONTENT="{\"permission\":$perm}" exec opencode run "${model[@]}" "$prompt") >"$base.ai" 2>"$base.err" & ;;
+    interpreter)
+      local py; py=$(head -1 "$(command -v interpreter)"); py=${py#\#!}; [[ "$py" == *env* ]] && py=${py##* }
+      (cd / && exec "$py" -c 'import sys
+from interpreter import interpreter
+interpreter.auto_run = False
+for m in interpreter.chat(sys.argv[1], display=False):
+    if m.get("role") == "assistant" and m.get("type") == "message": print(m.get("content", ""))' "$prompt" </dev/null) >"$base.ai" 2>"$base.err" & ;;
+    *) echo "  No AI tool selected" >&2; return 1 ;;
+  esac
+  if [[ -t 1 ]]; then spin $! "Asking $(tool_name "$AI_TOOL") (usually 1–5 min, Ctrl-C cancels)"; else wait $!; fi
+}
+
+ai_render() {
+  local base=$1 rest header
+  { read -r rest; IFS= read -r header; } <"$base.meta"
+  awk -v cand="$base.cand" -v sort="$AI_SORT" -v showdate="$AI_LASTUSED" -v details="$AI_DETAILS" \
+      -v rest="$rest" -v header="$header" -v home="$HOME" -v cols="$COLS" \
+      -v B="$BOLD" -v D="$DIM" -v R="$RST" -v M="$MAGENTA" -v Y="$YELLOW" -v C="$CYAN" '
+    function hum(a) { return a >= 1048576 ? sprintf("%.1f GB", a / 1048576) : sprintf("%.0f MB", a / 1024) }
+    function cut(s, w) { return length(s) > w ? "…" substr(s, length(s) - w + 2) : s }
+    function cutr(s, w) { return length(s) > w ? substr(s, 1, w - 1) "…" : s }
+    function base(p) { sub(/\/$/, "", p); sub(/.*\//, "", p); return p == "" ? "/" : p }
+    function name(id,  a) {
+      if (match(path[id], /[^\/]*\.app(\/|$)/)) { a = substr(path[id], RSTART, RLENGTH); sub(/\/$/, "", a); sub(/\.app$/, "", a) }
+      else a = base(path[id])
+      return part[id] ? a " (rest)" : a }
+    function before(x, y, kind) {
+      if (sort == "name") return kind == "c" ? tolower(x) < tolower(y) : tolower(name(x)) < tolower(name(y))
+      if (sort == "old" || sort == "new") { a = kind == "c" ? newest[x] : mt[x]; b = kind == "c" ? newest[y] : mt[y]; return sort == "old" ? a < b : a > b }
+      a = kind == "c" ? tot[x] : kb[x]; b = kind == "c" ? tot[y] : kb[y]
+      return sort == "size_asc" ? a < b : a > b }
+    BEGIN {
+      FS = "\t"
+      while ((getline line < cand) > 0) { split(line, f, "\t"); id = f[1]; ids[++n] = id; kb[id] = f[2]; mt[id] = f[3]; dt[id] = f[4]; path[id] = f[5]; part[id] = f[6] + 0 }
+      FS = "|"
+    }
+    { gsub(/\r/, ""); sub(/^[ \t`*>-]+/, ""); for (i = 1; i <= NF; i++) gsub(/^ +| +$/, "", $i)
+      if ($1 == "F" && ($2 in kb) && $3 != "") { cat[$2] = $3; desc[$2] = $4 }
+      else if ($1 == "C" && $2 != "") hint[$2] = $3 }
+    END {
+      for (i = 1; i <= n; i++) { id = ids[i]; c = (id in cat) ? cat[id] : "Not identified"
+        if (!(c in tot)) cats[++nc] = c
+        tot[c] += kb[id]; total += kb[id]; if (mt[id] > newest[c]) newest[c] = mt[id]; members[c] = members[c] " " id }
+      for (i = 2; i <= nc; i++) { v = cats[i]; for (j = i - 1; j >= 1 && before(v, cats[j], "c"); j--) cats[j + 1] = cats[j]; cats[j + 1] = v }
+
+      for (i = 1; i <= n; i++) { id = ids[i]; lab[id] = desc[id] != "" ? desc[id] : name(id); nm[id] = desc[id] != "" ? name(id) : ""
+        if (length(lab[id]) > lw) lw = length(lab[id]); if (length(nm[id]) > nw) nw = length(nm[id]) }
+      if (lw > 42) lw = 42; if (nw > 28) nw = 28
+      dw = showdate == "on" ? 12 : 0
+      pw = cols - 2 - 9 - 2 - lw - 2 - nw - dw - 2
+      printf "\n  %sWEMS%s  %s%s%s\n", M B, R, D, header, R
+      for (k = 1; k <= nc; k++) { c = cats[k]
+        printf "\n  %s%s  %s%s\n", B, c, hum(tot[c]), R
+        if (details == "on" && hint[c] != "") printf "  %s↳ %s%s\n", D, hint[c], R
+        m = split(substr(members[c], 2), its, " ")
+        for (i = 2; i <= m; i++) { v = its[i]; for (j = i - 1; j >= 1 && before(v, its[j], "i"); j--) its[j + 1] = its[j]; its[j + 1] = v }
+        for (i = 1; i <= m; i++) { id = its[i]; p = path[id]; sub(/\/[^\/]*$/, "", p); if (p == "") p = "/"; if (index(p, home) == 1) p = "~" substr(p, length(home) + 1)
+          printf "  %9s  %-*s  %s%-*s", hum(kb[id]), lw, cutr(lab[id], lw), D, nw, cutr(nm[id], nw)
+          if (showdate == "on") printf "  %10s", dt[id]
+          if (pw >= 12) printf "  %s", cut(p, pw)
+          printf "%s\n", R }
+      }
+      printf "\n  %s%s in the folders above · %s more in smaller folders (under the minimum size)%s\n", D, hum(total), hum(rest), R
+    }' "$base.ai"
+}
+
+ai_run() {
+  [[ -n "$AI_TOOL" ]] || { echo "  No AI tool found. Install Claude Code, Codex, opencode or Open Interpreter."; return 1; }
+  local src label base
+  load_snaps
+  if is_custom; then
+    tmpfile; src=$TMPF; label="scan of $(tilde "$AI_SCOPE")"
+    ({ nice du -xk -d "$DEPTH" "$AI_SCOPE"; big_files "$AI_MIN_MB" "$AI_SCOPE"; } 2>/dev/null | gzip -c >"$src") &
+    if [[ -t 1 ]]; then spin $! "Scanning $(tilde "$AI_SCOPE")"; else wait $!; fi
+  elif [[ "$AI_SOURCE" == "scan" || ${#SNAPS[@]} -eq 0 ]]; then
+    scan_current || return 1; src=$CURRENT_SCAN; label="scan of $(date '+%b %d %H:%M')"
+  else
+    src=${SNAPS[0]}; label="snapshot of $(date -r "$(snap_meta "$src" | awk '{print $1}')" '+%b %d %H:%M')"
+  fi
+  mkdir -p "$REPORT_DIR"
+  base="$REPORT_DIR/$(date +%Y-%m-%d_%H%M%S)"
+  local priv="privacy on"; [[ "$AI_PRIVACY" == "off" ]] && priv="privacy off"
+  printf '  Finding folders and files over %s…\n' "$(human $((AI_MIN_MB * 1024)))"
+  ai_candidates "$src" "$base" "$(tool_name "$AI_TOOL") · $priv · $label"
+  if [[ ! -s "$base.cand" ]]; then echo "  Nothing at or above that size. Lower the minimum size."; rm -f "$base".*; return 1; fi
+  printf '  %s items to identify\n' "$(wc -l <"$base.cand" | tr -d ' ')"
+  ai_prompt "$base.cand" >"$base.prompt"
+  ai_exec "$base"; local rc=$?
+  if ! grep -Eq '^[[:space:]`*>-]*F[[:space:]]*\|' "$base.ai" 2>/dev/null; then
+    printf '  %s%s gave no usable answer%s (exit %s). Its last output:\n' "$RED" "$(tool_name "$AI_TOOL")" "$RST" "$rc"
+    tail -n 12 "$base.err" "$base.ai" 2>/dev/null | sed 's/^/    /'
+    rm -f "$base".*; return 1
+  fi
+  AI_LAST=$base
+  ai_render "$base" | sed $'s/\033\\[[0-9;]*m//g' >"$base.txt"
+}
+
+row() { printf '%-16s %s' "$1" "$2"; }
+onoff() { [[ "$1" == "on" ]] && echo "On" || echo "Off"; }
+
+tui_ai() {
+  ai_load
+  if ((${#AI_AVAILABLE[@]} == 0)); then
+    screen; echo "  No AI tool found. Install one of: Claude Code, Codex, opencode, Open Interpreter."; press_any_key; return
+  fi
+  local sel=0 last priv data
+  while :; do
+    last=$(ls -1 "$REPORT_DIR"/*.cand 2>/dev/null | tail -1); last=${last%.cand}
+    priv="On   ${DIM}AI sees folder paths, sizes and dates only${RST}"
+    [[ "$AI_PRIVACY" == "off" ]] && priv="Off  ${DIM}AI may open files (read-only) to identify them${RST}"
+    [[ "$AI_TOOL" == "interpreter" ]] && priv="On   ${DIM}locked: Open Interpreter has no read-only mode${RST}"
+    data="Latest snapshot  ${DIM}fast${RST}"; [[ "$AI_SOURCE" == "scan" ]] && data="Fresh scan  ${DIM}1–2 min extra${RST}"
+    is_custom && data="Fresh scan of that folder  ${DIM}always, for your own folders${RST}"
+    MENU_START=$sel MENU_LR=1
+    menu "${BOLD}AI MODE${RST}  ${DIM}an AI names what your biggest folders are · it can only read, never change${RST}" \
+      "${CYAN}${BOLD}Run analysis${RST}" \
+      "$(row "AI tool" "$(tool_name "$AI_TOOL")  ${DIM}(${#AI_AVAILABLE[@]} installed)${RST}")" \
+      "$(row "Privacy" "$priv")" \
+      "$(row "Show last used" "$(onoff "$AI_LASTUSED")")" \
+      "$(row "Sort by" "$(sort_name)")" \
+      "$(row "Minimum size" "$(human $((AI_MIN_MB * 1024))) ${CYAN}${BOLD}→${RST}")" \
+      "$(row "Scope" "$([[ -z "$AI_SCOPE" ]] && echo "${YELLOW}${BOLD}Select →${RST}  ${DIM}pick what the AI should look at${RST}" || echo "$(scope_name) ${CYAN}${BOLD}→${RST}")")" \
+      "$(row "Data" "$data")" \
+      "$(row "Show details" "$(onoff "$AI_DETAILS")  ${DIM}cleanup hint per group${RST}")" \
+      "$(row "Last report" "$([[ -n "$last" ]] && echo "$(basename "$last")  ${DIM}re-sorted with the settings above${RST}" || echo "${DIM}none yet${RST}")")"
+    sel=$PICK
+    case $PICK in
+      -1) return ;;
+      0) ((MENU_DIR > 0)) || continue
+         [[ -z "$AI_SCOPE" ]] && tui_scope_pick
+         [[ -z "$AI_SCOPE" ]] && continue
+         screen; if ai_run; then show_page "$(ai_render "$AI_LAST")"; else press_any_key; fi ;;
+      1) AI_TOOL=$(step "$AI_TOOL" "${AI_AVAILABLE[@]}"); [[ "$AI_TOOL" == "interpreter" ]] && AI_PRIVACY=on ;;
+      2) [[ "$AI_TOOL" == "interpreter" ]] || AI_PRIVACY=$(step "$AI_PRIVACY" on off) ;;
+      3) AI_LASTUSED=$(step "$AI_LASTUSED" on off) ;;
+      4) AI_SORT=$(step "$AI_SORT" "${AI_SORTS[@]}") ;;
+      5) ((MENU_DIR > 0)) && tui_min_pick ;;
+      6) ((MENU_DIR > 0)) && tui_scope_pick ;;
+      7) is_custom || AI_SOURCE=$(step "$AI_SOURCE" snapshot scan) ;;
+      8) AI_DETAILS=$(step "$AI_DETAILS" on off) ;;
+      9) ((MENU_DIR > 0)) && [[ -n "$last" ]] && { screen; show_page "$(ai_render "$last")"; } ;;
+    esac
+    ai_save
+  done
+}
+
+add_scope() {
+  local p
+  screen
+  if [[ -z "${SSH_TTY:-}" ]] && command -v osascript >/dev/null; then
+    printf '  %sADD FOLDER%s  %spick a folder in the window that just opened%s\n' "$BOLD" "$RST" "$DIM" "$RST"
+    p=$(osascript -e 'activate' -e 'POSIX path of (choose folder with prompt "Pick a folder for WEMS AI mode" default location (path to home folder))' 2>/dev/null) || return 1
+  else
+    printf '  %sADD FOLDER%s  %se.g. ~/Documents/xyz · Tab completes · empty cancels%s\n\n' "$BOLD" "$RST" "$DIM" "$RST"
+    tput cnorm; IFS= read -e -r -p "  Folder: " p; tput civis
+  fi
+  p="${p#"${p%%[! ]*}"}"; p="${p%"${p##*[! ]}"}"
+  [[ -z "$p" ]] && return 1
+  [[ "$p" == "~" || "$p" == "~/"* ]] && p="$HOME${p#\~}"
+  if ! p=$(cd "$p" 2>/dev/null && pwd -P); then printf '\n  %sNot a folder you can open.%s\n' "$RED" "$RST"; press_any_key; return 1; fi
+  is_scope "$p" || AI_SCOPES+=("$p")
+  AI_SCOPE=$p; ai_save
+}
+
+tui_min_pick() {
+  local m items=() sel=0 i=0
+  for m in "${AI_MINS[@]}"; do items+=("$(human $((m * 1024)))"); [[ "$m" == "$AI_MIN_MB" ]] && sel=$i; i=$((i + 1)); done
+  MENU_START=$sel
+  menu "${BOLD}MINIMUM SIZE${RST}  ${DIM}only folders and files at least this big go to the AI${RST}" "${items[@]}"
+  ((PICK >= 0)) && AI_MIN_MB=${AI_MINS[PICK]}
+}
+
+tui_scope_pick() {
+  local p items=("Whole disk" "Home folder only") sel=0 i=2
+  [[ "$AI_SCOPE" == home ]] && sel=1
+  for p in "${AI_SCOPES[@]}"; do items+=("$(tilde "$p")"); [[ "$p" == "$AI_SCOPE" ]] && sel=$i; i=$((i + 1)); done
+  items+=("${CYAN}${BOLD}+ Add new folder${RST}")
+  MENU_START=$sel
+  menu "${BOLD}SCOPE${RST}  ${DIM}what should the AI look at?${RST}" "${items[@]}"
+  case $PICK in
+    -1) ;;
+    0) AI_SCOPE=disk ;;
+    1) AI_SCOPE=home ;;
+    $((${#items[@]} - 1))) add_scope ;;
+    *) AI_SCOPE=${AI_SCOPES[PICK - 2]} ;;
+  esac
+}
+
+tui_scopes() {
+  local sel=0 p i items keep
+  while :; do
+    items=("${CYAN}${BOLD}+ Add folder${RST}")
+    for p in "${AI_SCOPES[@]}"; do items+=("$(tilde "$p")  ${DIM}⏎ remove${RST}"); done
+    MENU_START=$sel
+    menu "${BOLD}SAVED FOLDERS${RST}  ${DIM}folders AI mode can scan · pick one under AI mode → Scope${RST}" "${items[@]}"
+    sel=$PICK
+    case $PICK in
+      -1) return ;;
+      0) add_scope ;;
+      *)
+        p=${AI_SCOPES[PICK - 1]}
+        confirm "Remove $(tilde "$p")?" || continue
+        keep=(); for i in "${AI_SCOPES[@]}"; do [[ "$i" == "$p" ]] || keep+=("$i"); done
+        AI_SCOPES=(); ((${#keep[@]})) && AI_SCOPES=("${keep[@]}")
+        [[ "$AI_SCOPE" == "$p" ]] && AI_SCOPE=""
+        ai_save; sel=0 ;;
+    esac
+  done
+}
+
+tui_settings() {
+  local sel=0 items
+  while :; do
+    if ai_on; then
+      ai_load
+      items=("$(row "AI mode" "On")" "$(row "Saved folders" "${#AI_SCOPES[@]} saved  ${DIM}extra scopes for AI mode${RST}")")
+    else
+      items=("$(row "AI mode" "Off  ${DIM}hidden from the menu${RST}")")
+    fi
+    MENU_START=$sel
+    menu "${BOLD}SETTINGS${RST}" "${items[@]}"
+    sel=$PICK
+    case $PICK in
+      -1) return ;;
+      0) if ai_on; then set_ai off; else set_ai on; fi ;;
+      1) tui_scopes ;;
+    esac
+  done
+}
+
+ask_ai() {
+  menu "${BOLD}AI MODE?${RST}  ${DIM}an AI can name what your biggest folders are · it can only read · change it later in Settings${RST}" \
+    "Turn it on" \
+    "Leave it off  ${DIM}AI mode won't show up anywhere${RST}"
+  case $PICK in 0) set_ai on ;; 1) set_ai off ;; esac
+}
+
+do_update() {
+  printf '  Installed: v%s. Downloading the latest from github.com/%s…\n\n' "$VERSION" "$REPO"
+  local inst
+  if inst=$(curl -fsSL "https://raw.githubusercontent.com/$REPO/main/install.sh") && bash -c "$inst"; then
+    printf '\n  Now: %s\n' "$("${WEMS_BIN:-$HOME/.local/bin}/wems" --version 2>/dev/null)"
+  else
+    printf '  %sUpdate failed%s (no internet, or the repo has no release yet)\n' "$RED" "$RST"; return 1
+  fi
+}
+
+banner() {
+  printf '%s' "$MAGENTA$BOLD"
+  cat <<'EOF'
+
+  __        __ _____  __  __  ____
+  \ \      / /| ____||  \/  |/ ___|
+   \ \ /\ / / |  _|  | |\/| |\___ \
+    \ V  V /  | |___ | |  | | ___) |
+     \_/\_/   |_____||_|  |_||____/
+EOF
+  printf '%s  %sWhat'"'"'s Eating My Storage?%s  %sv%s%s\n\n' "$RST" "$CYAN" "$RST" "$DIM" "$VERSION" "$RST"
+}
+
+read_key() {
+  local k r
+  IFS= read -rsn1 k || { echo QUIT; return; }
+  case "$k" in
+    $'\x1b')
+      IFS= read -rsn2 -t 1 r
+      case "$r" in '[A') echo UP ;; '[B') echo DOWN ;; '[C') echo RIGHT ;; '[D') echo LEFT ;; *) echo QUIT ;; esac ;;
+    '') echo ENTER ;;
+    k | K) echo UP ;; j | J) echo DOWN ;; q | Q | $'\x7f' | $'\x08') echo QUIT ;;
+    *) echo "$k" ;;
+  esac
+}
+
+menu() {
+  local title=$1; shift
+  local items=("$@") n=$# sel=${MENU_START:-0} top=0 rows big i key lines lr=${MENU_LR:-0} keys
+  MENU_START=0 MENU_LR=0
+  keys="↑↓ Navigate  ⏎ Select  ⌫ Esc Back"; ((lr)) && keys="↑↓ Navigate  ←→ Change  ⏎ Select  ⌫ Esc Back"
+  while :; do
+    lines=$(tput lines); big=1; rows=$((lines - 13))
+    ((n > rows)) && { big=0; rows=$((lines - 5)); }
+    ((n > rows)) && rows=$((rows - 1))
+    ((rows < 3)) && rows=3
+    ((sel < top)) && top=$sel
+    ((sel >= top + rows)) && top=$((sel - rows + 1))
+    printf '\033[H\033[2J'; ((big)) && banner
+    printf '  %s\n\n' "$title"
+    for ((i = top; i < n && i < top + rows; i++)); do
+      if ((i == sel)); then printf '  %s➤ %s%s\n' "$CYAN$BOLD" "${items[i]}" "$RST"
+      else printf '    %s\n' "${items[i]}"; fi
+    done
+    ((n > rows)) && printf '    %s%d of %d%s\n' "$DIM" $((sel + 1)) "$n" "$RST"
+    printf '\n  %s%s%s\n' "$DIM" "$keys" "$RST"
+    key=$(read_key)
+    case "$key" in
+      UP) if ((sel > 0)); then sel=$((sel - 1)); else sel=$((n - 1)); fi ;;
+      DOWN) sel=$(( (sel + 1) % n )) ;;
+      ENTER | RIGHT) PICK=$sel MENU_DIR=1; return ;;
+      LEFT) ((lr)) && { PICK=$sel MENU_DIR=-1; return; } ;;
+      QUIT) PICK=-1; return ;;
+      [1-9]) if ((key <= n)); then PICK=$((key - 1)); return; fi ;;
+    esac
+  done
+}
+
+screen() { printf '\033[H\033[2J'; banner; }
+
+snap_items() {
+  ITEMS=(); local f
+  for f in "${SNAPS[@]}"; do ITEMS+=("$(snap_label "$f")"); done
+}
+
+status_line() {
+  local total used free last=""
+  read -r total used free <<<"$(disk_kb)"
+  load_snaps
+  if ((${#SNAPS[@]})); then local c; read -r c _ _ <<<"$(snap_meta "${SNAPS[0]}")"; last=" · last $(ago "$c")"; fi
+  printf '%sFree %s%s of %s · %d snapshots%s · auto %s%s' "$DIM" "$RST$BOLD$(human "$free")$RST$DIM" "" \
+    "$(human "$total")" "${#SNAPS[@]}" "$last" "$(auto_status)" "$RST"
+}
+
+tui_snapshot() {
+  screen; printf '  %sSAVE SNAPSHOT%s\n\n' "$BOLD" "$RST"
+  save_snapshot || { press_any_key; return; }
+  printf '  %s✓ Saved%s  %s\n' "$GREEN" "$RST" "$(snap_label "$SAVED")"
+  printf '\n  %sCome back after your disk fills up again and pick Compare.%s\n' "$DIM" "$RST"
+  press_any_key
+}
+
+tui_compare() {
+  load_snaps
+  if ((${#SNAPS[@]} == 0)); then screen; echo "  No snapshots yet. Save one first, then compare later."; press_any_key; return; fi
+  snap_items
+  menu "${BOLD}COMPARE${RST}  ${DIM}what do you want to look at?${RST}" "Current system  ${DIM}(scans now, 1–2 min)${RST}" "${ITEMS[@]}"
+  ((PICK < 0)) && return
+  local first=$PICK newer older
+  local others=() idx=() i
+  for ((i = 0; i < ${#SNAPS[@]}; i++)); do ((i + 1 == first)) || { others+=("${ITEMS[i]}"); idx+=("$i"); }; done
+  if ((${#others[@]} == 0)); then screen; echo "  You need a second snapshot to compare against."; press_any_key; return; fi
+  menu "${BOLD}COMPARE${RST}  ${DIM}…against which snapshot?${RST}" "${others[@]}"
+  ((PICK < 0)) && return
+  older=${SNAPS[${idx[PICK]}]}
+  screen
+  CURRENT_SCAN=""
+  if ((first == 0)); then scan_current || { press_any_key; return; }; newer=$CURRENT_SCAN
+  else newer=${SNAPS[first - 1]}; fi
+  show_page "$(compare "$older" "$newer")"
+  ((first == 0)) && offer_save_current
+}
+
+tui_delete() {
+  while :; do
+    load_snaps
+    if ((${#SNAPS[@]} == 0)); then screen; echo "  No snapshots to delete."; press_any_key; return; fi
+    snap_items
+    menu "${BOLD}DELETE SNAPSHOTS${RST}  ${DIM}$(du -sh "$SNAP_DIR" | awk '{print $1}') on disk${RST}" \
+      "All snapshots (${#SNAPS[@]})" "All except the latest" "${ITEMS[@]}"
+    ((PICK < 0)) && return
+    local doomed=()
+    case $PICK in
+      0) doomed=("${SNAPS[@]}") ;;
+      1) doomed=("${SNAPS[@]:1}") ;;
+      *) doomed=("${SNAPS[PICK - 2]}") ;;
+    esac
+    if ((${#doomed[@]} == 0)); then continue; fi
+    screen
+    if confirm "Delete ${#doomed[@]} snapshot(s)? This cannot be undone."; then rm -f "${doomed[@]}"; fi
+  done
+}
+
+tui_auto() {
+  local cur; cur=$(auto_status)
+  menu "${BOLD}AUTO SNAPSHOTS${RST}  ${DIM}currently $cur · a background job saves one on a schedule${RST}" \
+    "Every hour" "Every 3 hours" "Every 6 hours" "Every 12 hours" "Off"
+  ((PICK < 0)) && return
+  screen
+  case $PICK in 0) set_auto 1 ;; 1) set_auto 3 ;; 2) set_auto 6 ;; 3) set_auto 12 ;; 4) set_auto off ;; esac
+  press_any_key
+}
+
+tui() {
+  tput smcup; ALT_SCREEN=1
+  tput civis
+  [[ -f "$AI_FLAG" ]] || ask_ai
+  MAIN_SEL=0
+  local labels acts act
+  while :; do
+    labels=("Save snapshot      ${DIM}Record what's using space right now${RST}"
+      "Compare            ${DIM}See what grew since a snapshot${RST}")
+    acts=(snap compare)
+    if ai_on; then
+      labels+=("AI mode            ${DIM}Let an AI name what your biggest folders are${RST}")
+      acts+=(ai)
+    fi
+    labels+=("Space hogs         ${DIM}Check the usual suspects${RST}"
+      "Watch free space   ${DIM}Live ticker, catch it while it happens${RST}"
+      "Auto snapshots     ${DIM}Save one every few hours ($(auto_status))${RST}"
+      "Delete snapshots   ${DIM}Remove old snapshots${RST}"
+      "Settings           ${DIM}Change how WEMS works${RST}"
+      "Update             ${DIM}Get the newest version from GitHub${RST}"
+      "Quit")
+    acts+=(hogs watch auto delete settings update quit)
+    MENU_START=$MAIN_SEL
+    menu "$(status_line)" "${labels[@]}"
+    MAIN_SEL=$PICK
+    act=quit; ((PICK >= 0)) && act=${acts[PICK]}
+    case $act in
+      snap) tui_snapshot ;; compare) tui_compare ;; ai) tui_ai ;; hogs) screen; hogs ;; watch) watch_free ;;
+      auto) tui_auto ;; delete) tui_delete ;; settings) tui_settings ;;
+      update) screen; if do_update; then press_any_key; exec "${WEMS_BIN:-$HOME/.local/bin}/wems"; fi; press_any_key ;;
+      *) printf '\033[H\033[2J'; break ;;
+    esac
+  done
+}
+
+usage() {
+  banner
+  cat <<EOF | if ai_on; then cat; else grep -vE 'wems ai |WEMS_AI_'; fi
+  ${BOLD}Usage${RST}
+    wems                   Open the menu
+    wems snap              Save a snapshot
+    wems list              List snapshots (1 = newest)
+    wems diff [A] [B]      Compare two snapshots. A and B are numbers from
+                           'wems list' or 'now'. Default: newest vs now
+    wems ai                Let an AI name your biggest folders (settings from the menu)
+    wems hogs              Sizes of the usual space hogs
+    wems watch             Live free-space ticker
+    wems auto <hours|off>  Save a snapshot every N hours in the background
+    wems rm <N|all|old>    Delete snapshot N, all, or all but the newest
+    wems update            Install the latest version
+    wems uninstall         Remove wems (asks before deleting snapshots)
+
+  ${BOLD}Settings${RST} ${DIM}(environment variables)${RST}
+    WEMS_MIN_MB=$MIN_MB   WEMS_TOP=$TOP   WEMS_DEPTH=$DEPTH
+    WEMS_AUTO_KEEP=$AUTO_KEEP   WEMS_HOME=$WEMS_HOME
+    WEMS_AI_MODEL=<model>  WEMS_AI_MAX=$AI_MAX
+EOF
+}
+
+resolve() {
+  load_snaps
+  if [[ "$1" =~ ^[0-9]+$ ]] && (($1 >= 1 && $1 <= ${#SNAPS[@]})); then echo "${SNAPS[$1 - 1]}"; return; fi
+  [[ -f "$1" ]] && { echo "$1"; return; }
+  echo "  No snapshot '$1'. See: wems list" >&2; return 1
+}
+
+case "${1:-}" in
+  "") if [[ -t 0 && -t 1 ]]; then tui; else usage; fi ;;
+  snap) if [[ "${2:-}" == "--auto" ]]; then save_snapshot auto; else save_snapshot && echo "  ${GREEN}✓ Saved${RST}  $(snap_label "$SAVED")"; fi ;;
+  list)
+    load_snaps
+    ((${#SNAPS[@]})) || echo "  No snapshots yet. Run: wems snap"
+    for ((i = 0; i < ${#SNAPS[@]}; i++)); do printf '  %s%2d%s  %s\n' "$BOLD" $((i + 1)) "$RST" "$(snap_label "${SNAPS[i]}")"; done ;;
+  diff)
+    load_snaps
+    ((${#SNAPS[@]})) || { echo "  No snapshots yet. Run: wems snap"; exit 1; }
+    a=$(resolve "${2:-1}") || exit 1
+    if [[ "${3:-now}" == "now" ]]; then scan_current || exit 1; b=$CURRENT_SCAN; else b=$(resolve "$3") || exit 1; fi
+    compare "$a" "$b" ;;
+  hogs) hogs ;;
+  ai) ai_on || { echo "  AI mode is off. Turn it on in wems → Settings."; exit 1; }
+    ai_load; AI_SCOPE=${AI_SCOPE:-disk}; ai_run && ai_render "$AI_LAST" ;;
+  watch) watch_free ;;
+  auto) set_auto "${2:-}" ;;
+  rm)
+    load_snaps
+    case "${2:-}" in
+      all) rm -f "${SNAPS[@]}" && echo "  Deleted ${#SNAPS[@]} snapshot(s)" ;;
+      old) ((${#SNAPS[@]} > 1)) && rm -f "${SNAPS[@]:1}"; echo "  Kept the newest snapshot" ;;
+      *) f=$(resolve "${2:-x}") && rm -f "$f" && echo "  Deleted $(basename "$f")" ;;
+    esac ;;
+  update) do_update ;;
+  uninstall) uninstall ;;
+  -v | --version | version) echo "wems $VERSION" ;;
+  -h | --help | help) usage ;;
+  *) usage; exit 1 ;;
+esac
