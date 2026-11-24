@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 REPO="${WEMS_REPO:-SearisIQ/wems}"
 WEMS_HOME="${WEMS_HOME:-$HOME/.local/share/wems}"
 SNAP_DIR="$WEMS_HOME/snapshots"
@@ -250,6 +250,21 @@ HOGS=(
   "Claude app VM|$HOME/Library/Application Support/Claude/vm_bundles|Used by the Claude desktop app; rebuilt if deleted"
   "Mail attachments|$HOME/Library/Containers/com.apple.mail/Data/Library/Mail Downloads|Old opened attachments"
   "System logs|/private/var/log|Rotated by macOS"
+  "App logs|$HOME/Library/Logs|Safe to delete; apps write new ones"
+  "Temporary files|$(dirname "$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)")|Per-user temp and caches; a restart clears most of it"
+  "Ollama models|$HOME/.ollama/models|ollama rm <model> for models you no longer use"
+  "LM Studio models|$HOME/.lmstudio/models|Delete unused models in LM Studio → My Models"
+  "Hugging Face models|$HOME/.cache/huggingface|huggingface-cli delete-cache"
+  "VS Code extensions|$HOME/.vscode/extensions|Old versions pile up; uninstall unused extensions"
+  "Cursor extensions|$HOME/.cursor/extensions|Old versions pile up; uninstall unused extensions"
+  "Messages attachments|$HOME/Library/Messages/Attachments|Settings → General → Storage → Messages"
+  "Node versions (nvm)|$HOME/.nvm/versions|nvm uninstall <version> for old ones"
+  "conda packages|$HOME/miniconda3/pkgs|conda clean --all"
+  "conda packages|$HOME/anaconda3/pkgs|conda clean --all"
+  "OrbStack|$HOME/.orbstack|docker system prune -a; delete unused machines"
+  "Colima VM|$HOME/.colima|colima delete for unused profiles"
+  "UTM VMs|$HOME/Library/Containers/com.utmapp.UTM|Delete unused VMs in UTM"
+  "Xcode archives|$HOME/Library/Developer/Xcode/Archives|Xcode → Organizer → delete old archives"
 )
 
 hogs() {
