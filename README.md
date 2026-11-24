@@ -94,7 +94,7 @@ With privacy on, the AI only sees folder paths, sizes and dates. With privacy of
 The AI mode menu also lets you pick:
 
 - Sort order: size, last used, or name.
-- Minimum folder size: 100 MB, 500 MB, 1 GB or 5 GB.
+- Minimum folder size: 20 MB, 50 MB, 100 MB, 200 MB, 500 MB (default), 1 GB, 2 GB, 5 GB or 10 GB.
 - Scope: the whole disk, your home folder, or a folder you add yourself, like `~/Documents/xyz`. Your own folders are scanned fresh each time. The other two scopes can use the latest snapshot, which is instant.
 - Whether to show the last-used date and a short note on what each folder is.
 
