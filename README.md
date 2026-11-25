@@ -50,7 +50,7 @@ wems help
 
 A snapshot records the size of every folder on the data volume, six levels deep, and takes up about 300 KB.
 
-`hogs` checks the places that tend to fill up: macOS updates waiting to install, caches, Xcode, Docker, iPhone backups, and folders in `/Volumes` that look like external drives but are actually on your internal disk.
+`hogs` checks the places that tend to fill up: macOS updates waiting to install, caches, logs, Xcode, Docker and other VMs, local AI models, editor extensions, Node and conda installs, iPhone backups, Messages attachments, and folders in `/Volumes` that look like external drives but are actually on your internal disk.
 
 The menu also has a live view of free space, which shows how fast it's going down.
 
