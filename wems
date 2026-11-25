@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-VERSION="1.6.0"
+VERSION="1.6.1"
 REPO="${WEMS_REPO:-SearisIQ/wems}"
 WEMS_HOME="${WEMS_HOME:-$HOME/.local/share/wems}"
 SNAP_DIR="$WEMS_HOME/snapshots"
@@ -232,7 +232,7 @@ offer_save_current() {
 
 HOGS=(
   "macOS update staging|/System/Volumes/Update|Install the pending update: Settings → General → Software Update"
-  "Downloaded macOS assets|/System/Library/AssetsV2|Managed by macOS; shrinks once updates install"
+  "Downloaded macOS assets|/System/Library/AssetsV2|Siri, language and other system downloads; managed by macOS"
   "Sleep image and swap|/private/var/vm|Restart to shrink swap"
   "App caches|$HOME/Library/Caches|Apps rebuild these; clear per app"
   "Dev tool caches|$HOME/.cache|Safe to clear (uv cache clean, pip cache purge, …)"
